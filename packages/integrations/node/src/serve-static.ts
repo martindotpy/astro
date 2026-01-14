@@ -4,8 +4,88 @@ import path from 'node:path';
 import url from 'node:url';
 import { hasFileExtension, isInternalPath } from '@astrojs/internal-helpers/path';
 import type { NodeApp } from 'astro/app/node';
+import * as mime from 'mime-types';
 import send from 'send';
 import type { Options } from './types.js';
+
+/**
+ * Creates a stream handler function for serving static files.
+ *
+ * When compression is enabled, the handler will:
+ * 1. Check if a compressed version of the requested file exists
+ * 2. Verify that the client supports the compression encoding via `Accept-Encoding`
+ * 3. Serve the compressed file with appropriate headers (`Content-Encoding`, `Vary`, `Content-Type`)
+ *
+ * When compression is disabled, files are served directly without modification.
+ *
+ * @param options - The adapter options containing compression configuration
+ * @returns A function that creates a readable stream for the requested file
+ */
+function createStreamHandler(options: Options) {
+	const { compression } = options;
+
+	if (!compression)
+		return function (req: IncomingMessage, pathname: string, client: string) {
+			const stream = send(req, pathname, {
+				root: client,
+				dotfiles: pathname.startsWith('/.well-known/') ? 'allow' : 'deny',
+			});
+
+			stream.on('headers', (_res: ServerResponse) => {
+				// assets in dist/_astro are hashed and should get the immutable header
+				if (pathname.startsWith(`/${options.assets}/`)) {
+					// This is the "far future" cache header, used for static files whose name includes their digest hash.
+					// 1 year (31,536,000 seconds) is convention.
+					// Taken from https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Cache-Control#immutable
+					_res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+				}
+			});
+
+			return stream;
+		};
+
+	return function (req: IncomingMessage, pathname: string, client: string) {
+		const absolutePath = path.join(client, pathname);
+		const acceptEncoding = req.headers['accept-encoding'] || '';
+		let finalPathname = pathname;
+		let contentEncoding: undefined | string;
+
+		for (const { encoding, extension } of compression) {
+			if (acceptEncoding.includes(encoding) && fs.existsSync(absolutePath + extension)) {
+				finalPathname = pathname + extension;
+				contentEncoding = encoding;
+				break;
+			}
+		}
+
+		const stream = send(req, finalPathname, {
+			root: client,
+			dotfiles: pathname.startsWith('/.well-known/') ? 'allow' : 'deny',
+		});
+
+		stream.on('headers', (_res: ServerResponse) => {
+			// assets in dist/_astro are hashed and should get the immutable header
+			if (pathname.startsWith(`/${options.assets}/`)) {
+				// This is the "far future" cache header, used for static files whose name includes their digest hash.
+				// 1 year (31,536,000 seconds) is convention.
+				// Taken from https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Cache-Control#immutable
+				_res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+			}
+			if (contentEncoding) {
+				_res.setHeader('Content-Encoding', contentEncoding);
+				_res.setHeader('Vary', 'Accept-Encoding');
+
+				const type = mime.contentType(path.basename(pathname));
+
+				if (type) {
+					_res.setHeader('Content-Type', type);
+				}
+			}
+		});
+
+		return stream;
+	};
+}
 
 /**
  * Creates a Node.js http listener for static files and prerendered pages.
@@ -15,6 +95,7 @@ import type { Options } from './types.js';
  */
 export function createStaticHandler(app: NodeApp, options: Options) {
 	const client = resolveClientDir(options);
+	const streamHandler = createStreamHandler(options);
 	/**
 	 * @param ssr The SSR handler to be called if the static handler does not find a matching file.
 	 */
@@ -80,10 +161,7 @@ export function createStaticHandler(app: NodeApp, options: Options) {
 			// app.removeBase sometimes returns a path without a leading slash
 			pathname = prependForwardSlash(app.removeBase(pathname));
 
-			const stream = send(req, pathname, {
-				root: client,
-				dotfiles: pathname.startsWith('/.well-known/') ? 'allow' : 'deny',
-			});
+			const stream = streamHandler(req, pathname, client);
 
 			let forwardError = false;
 
@@ -96,15 +174,6 @@ export function createStaticHandler(app: NodeApp, options: Options) {
 				}
 				// File not found, forward to the SSR handler
 				ssr();
-			});
-			stream.on('headers', (_res: ServerResponse) => {
-				// assets in dist/_astro are hashed and should get the immutable header
-				if (pathname.startsWith(`/${options.assets}/`)) {
-					// This is the "far future" cache header, used for static files whose name includes their digest hash.
-					// 1 year (31,536,000 seconds) is convention.
-					// Taken from https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Cache-Control#immutable
-					_res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
-				}
 			});
 			stream.on('file', () => {
 				forwardError = true;
